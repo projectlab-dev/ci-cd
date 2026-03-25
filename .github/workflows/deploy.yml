@@ -47,8 +47,7 @@ jobs:
       image_prefix: ${{ steps.context.outputs.image_prefix }}
       state_file: ${{ steps.context.outputs.state_file }}
       has_changes: ${{ steps.services.outputs.has_changes || 'false' }}
-      services_catalog: ${{ steps.services.outputs.catalog || '[]' }}
-      matrix: ${{ steps.services.outputs.matrix || '{"include":[]}' }}
+      service_names: ${{ steps.services.outputs.service_names || '[]' }}
     steps:
       - id: context
         shell: bash
@@ -280,13 +279,9 @@ jobs:
 
             selected = [...new Set(selected)].filter((service) => serviceMap[service]);
 
-            const matrix = selected.map((service) => ({
-              service: serviceMap[service],
-            }));
-
-            core.setOutput("has_changes", String(matrix.length > 0));
+            core.setOutput("has_changes", String(selected.length > 0));
             core.setOutput("catalog", JSON.stringify(catalog));
-            core.setOutput("matrix", JSON.stringify({ include: matrix }));
+            core.setOutput("service_names", JSON.stringify(selected));
 
       - name: Validate required secrets
         if: steps.services.outputs.has_changes == 'true'
@@ -394,11 +389,39 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix || '{"include":[]}') }}
+      matrix:
+        service_name: ${{ fromJson(needs.prepare.outputs.service_names || '[]') }}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.build_ref }}
+
+      - id: service
+        name: Resolve service metadata
+        shell: bash
+        env:
+          SERVICE_NAME: ${{ matrix.service_name }}
+        run: |
+          set -euo pipefail
+
+          node <<'EOF'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const configPath = path.join(process.cwd(), ".github", "services.json");
+          const parsedConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+          const catalog = Array.isArray(parsedConfig.services) ? parsedConfig.services : [];
+          const service = catalog.find((entry) => entry.name === process.env.SERVICE_NAME);
+
+          if (!service) {
+            console.error(`Unknown service '${process.env.SERVICE_NAME}' in services catalog.`);
+            process.exit(1);
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `folder=${service.folder}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `dockerfile=${service.dockerfile}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `image=${service.image}\n`);
+          EOF
 
       - uses: docker/setup-buildx-action@v3
 
@@ -411,16 +434,16 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v5
         with:
-          context: ./${{ matrix.service.folder }}
-          file: ${{ matrix.service.dockerfile }}
+          context: ./${{ steps.service.outputs.folder }}
+          file: ${{ steps.service.outputs.dockerfile }}
           push: true
           tags: |
-            ${{ secrets.REGISTRY_URL }}/${{ needs.prepare.outputs.image_prefix }}-${{ matrix.service.image }}:${{ needs.prepare.outputs.immutable_tag }}
-            ${{ secrets.REGISTRY_URL }}/${{ needs.prepare.outputs.image_prefix }}-${{ matrix.service.image }}:${{ needs.prepare.outputs.floating_tag }}
+            ${{ secrets.REGISTRY_URL }}/${{ needs.prepare.outputs.image_prefix }}-${{ steps.service.outputs.image }}:${{ needs.prepare.outputs.immutable_tag }}
+            ${{ secrets.REGISTRY_URL }}/${{ needs.prepare.outputs.image_prefix }}-${{ steps.service.outputs.image }}:${{ needs.prepare.outputs.floating_tag }}
           build-args: |
             NODE_VERSION=${{ env.NODE_VERSION }}
             NODE_ENV=${{ needs.prepare.outputs.node_env }}
-            SERVICE_NAME=${{ matrix.service.name }}
+            SERVICE_NAME=${{ matrix.service_name }}
             APP_VERSION=${{ needs.prepare.outputs.immutable_tag }}
 
   deploy:
@@ -450,7 +473,7 @@ jobs:
         shell: bash
         env:
           TARGET_ENV: ${{ needs.prepare.outputs.environment }}
-          SERVICE_CATALOG: ${{ needs.prepare.outputs.services_catalog }}
+          SERVICE_NAMES: ${{ needs.prepare.outputs.service_names }}
           DEPLOY_CONFIG_STAGE: ${{ secrets.DEPLOY_CONFIG_STAGE }}
           DEPLOY_CONFIG_PROD: ${{ secrets.DEPLOY_CONFIG_PROD }}
         run: |
@@ -458,8 +481,22 @@ jobs:
 
           node <<'EOF'
           const fs = require("node:fs");
+          const path = require("node:path");
 
-          const services = JSON.parse(process.env.SERVICE_CATALOG);
+          const configPath = path.join(process.cwd(), ".github", "services.json");
+          const parsedConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+          const catalog = Array.isArray(parsedConfig.services) ? parsedConfig.services : [];
+          const selectedNames = JSON.parse(process.env.SERVICE_NAMES);
+          const services = selectedNames.map((name) => {
+            const service = catalog.find((entry) => entry.name === name);
+
+            if (!service) {
+              console.error(`Unknown service '${name}' in services catalog.`);
+              process.exit(1);
+            }
+
+            return service;
+          });
           const targetEnv = process.env.TARGET_ENV;
           const configSecret = targetEnv === "stage"
             ? process.env.DEPLOY_CONFIG_STAGE
@@ -546,19 +583,29 @@ jobs:
           FLOATING_TAG: ${{ needs.prepare.outputs.floating_tag }}
           REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
           IMAGE_PREFIX: ${{ needs.prepare.outputs.image_prefix }}
-          SERVICE_CATALOG: ${{ needs.prepare.outputs.services_catalog }}
+          SERVICE_NAMES: ${{ needs.prepare.outputs.service_names }}
           WEBHOOK_URL: ${{ steps.deploy_config.outputs.webhook_url }}
         run: |
           set -euo pipefail
 
           node <<'EOF' > rollback-targets.txt
           const fs = require("node:fs");
+          const path = require("node:path");
 
           const state = JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8"));
-          const services = JSON.parse(process.env.SERVICE_CATALOG);
+          const configPath = path.join(process.cwd(), ".github", "services.json");
+          const parsedConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+          const catalog = Array.isArray(parsedConfig.services) ? parsedConfig.services : [];
+          const selectedNames = JSON.parse(process.env.SERVICE_NAMES);
           const prefix = process.env.IMAGE_PREFIX;
 
-          for (const service of services) {
+          for (const name of selectedNames) {
+            const service = catalog.find((entry) => entry.name === name);
+            if (!service) {
+              console.error(`Unknown service '${name}' in services catalog.`);
+              process.exit(1);
+            }
+
             const tag = state[service.name];
 
             if (tag) {
@@ -588,7 +635,7 @@ jobs:
         shell: bash
         env:
           STATE_FILE: ${{ needs.prepare.outputs.state_file }}
-          SERVICE_MATRIX: ${{ needs.prepare.outputs.matrix }}
+          SERVICE_NAMES: ${{ needs.prepare.outputs.service_names }}
           IMMUTABLE_TAG: ${{ needs.prepare.outputs.immutable_tag }}
         run: |
           set -euo pipefail
@@ -598,13 +645,10 @@ jobs:
 
           const path = process.env.STATE_FILE;
           const state = JSON.parse(fs.readFileSync(path, "utf8"));
-          const matrix = JSON.parse(process.env.SERVICE_MATRIX);
-          const services = Array.isArray(matrix?.include)
-            ? matrix.include.map((entry) => entry.service)
-            : [];
+          const services = JSON.parse(process.env.SERVICE_NAMES);
 
-          for (const service of services) {
-            state[service.name] = process.env.IMMUTABLE_TAG;
+          for (const serviceName of services) {
+            state[serviceName] = process.env.IMMUTABLE_TAG;
           }
 
           fs.writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`);

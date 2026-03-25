@@ -5,7 +5,7 @@ const host = process.env.HOST ?? "0.0.0.0";
 
 const server = createServer();
 
-server.listen(port, host, () => {
+server.listen(port, host, () => {console.log('Service started.');
   console.log(`${host}:${port} ${process.env.SERVICE_NAME ?? "landing"} ready`);
 });
 

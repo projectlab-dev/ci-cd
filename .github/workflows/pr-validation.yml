@@ -25,8 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       has_changes: ${{ steps.services.outputs.has_changes || 'false' }}
-      services_catalog: ${{ steps.services.outputs.catalog || '[]' }}
-      matrix: ${{ steps.services.outputs.matrix || '{"include":[]}' }}
+      service_names: ${{ steps.services.outputs.service_names || '[]' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -123,48 +122,69 @@ jobs:
               }
             }
 
-            const matrix = [...new Set(selected)]
-              .filter((serviceName) => serviceMap[serviceName])
-              .map((serviceName) => ({
-                service: serviceMap[serviceName],
-              }));
+            const selectedNames = [...new Set(selected)].filter((serviceName) => serviceMap[serviceName]);
 
-            core.setOutput("has_changes", String(matrix.length > 0));
-            core.setOutput("catalog", JSON.stringify(catalog));
-            core.setOutput("matrix", JSON.stringify({ include: matrix }));
+            core.setOutput("has_changes", String(selectedNames.length > 0));
+            core.setOutput("service_names", JSON.stringify(selectedNames));
 
   validate:
-    name: Validate ${{ matrix.service.name }}
+    name: Validate ${{ matrix.service_name }}
     needs: prepare
     if: needs.prepare.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix || '{"include":[]}') }}
+      matrix:
+        service_name: ${{ fromJson(needs.prepare.outputs.service_names || '[]') }}
     steps:
       - uses: actions/checkout@v5
+
+      - id: service
+        name: Resolve service metadata
+        shell: bash
+        env:
+          SERVICE_NAME: ${{ matrix.service_name }}
+        run: |
+          set -euo pipefail
+
+          node <<'EOF'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const configPath = path.join(process.cwd(), ".github", "services.json");
+          const parsedConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+          const catalog = Array.isArray(parsedConfig.services) ? parsedConfig.services : [];
+          const service = catalog.find((entry) => entry.name === process.env.SERVICE_NAME);
+
+          if (!service) {
+            console.error(`Unknown service '${process.env.SERVICE_NAME}' in services catalog.`);
+            process.exit(1);
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `folder=${service.folder}\n`);
+          EOF
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: ${{ format('{0}/package-lock.json', matrix.service.folder) }}
+          cache-dependency-path: ${{ format('{0}/package-lock.json', steps.service.outputs.folder) }}
 
       - name: Install dependencies
-        working-directory: ${{ matrix.service.folder }}
+        working-directory: ${{ steps.service.outputs.folder }}
         run: npm ci
 
       - name: Run Linter
-        working-directory: ${{ matrix.service.folder }}
+        working-directory: ${{ steps.service.outputs.folder }}
         run: npm run lint --if-present
 
       - name: Run Tests
-        working-directory: ${{ matrix.service.folder }}
+        working-directory: ${{ steps.service.outputs.folder }}
         run: npm test
 
       - name: Build
-        working-directory: ${{ matrix.service.folder }}
+        working-directory: ${{ steps.service.outputs.folder }}
         run: npm run build
 
   security-scan:
