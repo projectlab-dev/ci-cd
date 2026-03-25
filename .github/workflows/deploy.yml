@@ -1,0 +1,666 @@
+name: Unified Deploy
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - stage
+      - main
+    types:
+      - closed
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+      services:
+        description: "Comma-separated services from `.github/services.json` or `all`"
+        required: false
+        default: "all"
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.context.outputs.environment }}
+      target_branch: ${{ steps.context.outputs.target_branch }}
+      build_ref: ${{ steps.context.outputs.build_ref }}
+      node_env: ${{ steps.context.outputs.node_env }}
+      should_deploy: ${{ steps.context.outputs.should_deploy }}
+      should_release: ${{ steps.context.outputs.should_release }}
+      sha_short: ${{ steps.context.outputs.sha_short }}
+      floating_tag: ${{ steps.context.outputs.floating_tag }}
+      immutable_tag: ${{ steps.version.outputs.immutable_tag }}
+      image_prefix: ${{ steps.context.outputs.image_prefix }}
+      state_file: ${{ steps.context.outputs.state_file }}
+      has_changes: ${{ steps.services.outputs.has_changes }}
+      services_catalog: ${{ steps.services.outputs.catalog }}
+      matrix: ${{ steps.services.outputs.matrix }}
+    steps:
+      - id: context
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ENV: ${{ github.event.inputs.environment }}
+          PR_TARGET: ${{ github.event.pull_request.base.ref }}
+          PR_SOURCE: ${{ github.event.pull_request.head.ref }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            ENVIRONMENT="$INPUT_ENV"
+          else
+            case "$PR_TARGET" in
+              dev) ENVIRONMENT="dev" ;;
+              stage) ENVIRONMENT="stage" ;;
+              main) ENVIRONMENT="prod" ;;
+              *)
+                echo "Unsupported target branch: $PR_TARGET"
+                exit 1
+                ;;
+            esac
+          fi
+
+          case "$ENVIRONMENT" in
+            dev)
+              TARGET_BRANCH="dev"
+              SHOULD_DEPLOY="false"
+              SHOULD_RELEASE="false"
+              NODE_ENV="development"
+              FLOATING_TAG="dev-latest"
+              STATE_FILE=""
+              ;;
+            stage)
+              TARGET_BRANCH="stage"
+              SHOULD_DEPLOY="true"
+              SHOULD_RELEASE="false"
+              NODE_ENV="staging"
+              FLOATING_TAG="stage-latest"
+              STATE_FILE=".github/deploy-state/stage.json"
+              ;;
+            prod)
+              TARGET_BRANCH="main"
+              SHOULD_DEPLOY="true"
+              SHOULD_RELEASE="true"
+              NODE_ENV="production"
+              FLOATING_TAG="latest"
+              STATE_FILE=".github/deploy-state/prod.json"
+              ;;
+            *)
+              echo "Unsupported environment: $ENVIRONMENT"
+              exit 1
+              ;;
+          esac
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if [[ "$PR_MERGED" != "true" ]]; then
+              echo "The workflow only runs for merged pull requests."
+              exit 1
+            fi
+
+            case "$ENVIRONMENT" in
+              dev)
+                [[ "$PR_SOURCE" == feature/* ]] || {
+                  echo "Only feature/* can promote to dev."
+                  exit 1
+                }
+                ;;
+              stage)
+                [[ "$PR_SOURCE" == "dev" ]] || {
+                  echo "Only dev can promote to stage."
+                  exit 1
+                }
+                ;;
+              prod)
+                [[ "$PR_SOURCE" == "stage" ]] || {
+                  echo "Only stage can promote to main."
+                  exit 1
+                }
+                ;;
+            esac
+          fi
+
+          SHORT_SHA="${SHA::7}"
+          IMAGE_PREFIX="$(echo "$REPOSITORY_NAME" | tr '[:upper:]' '[:lower:]')"
+
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$PR_MERGE_SHA" ]]; then
+            BUILD_REF="$PR_MERGE_SHA"
+          else
+            BUILD_REF="$TARGET_BRANCH"
+          fi
+
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "build_ref=$BUILD_REF" >> "$GITHUB_OUTPUT"
+          echo "node_env=$NODE_ENV" >> "$GITHUB_OUTPUT"
+          echo "should_deploy=$SHOULD_DEPLOY" >> "$GITHUB_OUTPUT"
+          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "floating_tag=$FLOATING_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_prefix=$IMAGE_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "state_file=$STATE_FILE" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.context.outputs.target_branch }}
+          fetch-depth: 0
+
+      - id: services
+        uses: actions/github-script@v7
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SERVICES_INPUT: ${{ github.event.inputs.services }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const path = require("node:path");
+
+            const configPath = path.join(process.cwd(), ".github", "services.json");
+            const rawConfig = fs.readFileSync(configPath, "utf8");
+            const parsedConfig = JSON.parse(rawConfig);
+            const catalog = Array.isArray(parsedConfig.services) ? parsedConfig.services : [];
+            const requiredPackageScripts = ["build", "test"];
+            const normalizePath = (value) => String(value).replace(/\\/g, "/").replace(/\/+$/, "");
+
+            if (catalog.length === 0) {
+              core.setFailed("`.github/services.json` must define at least one service.");
+              return;
+            }
+
+            for (const service of catalog) {
+              if (!service.name || !service.folder || !service.dockerfile || !service.image) {
+                core.setFailed("Each service in `.github/services.json` must define `name`, `folder`, `dockerfile` and `image`.");
+                return;
+              }
+
+              service.folder = normalizePath(service.folder);
+              service.dockerfile = normalizePath(service.dockerfile);
+
+              const serviceRoot = path.join(process.cwd(), service.folder);
+              const packageJsonPath = path.join(serviceRoot, "package.json");
+              const lockfilePath = path.join(serviceRoot, "package-lock.json");
+              const dockerfilePath = path.join(process.cwd(), service.dockerfile);
+
+              if (!fs.existsSync(serviceRoot) || !fs.statSync(serviceRoot).isDirectory()) {
+                core.setFailed(`Service folder not found: ${service.folder}`);
+                return;
+              }
+
+              if (!fs.existsSync(packageJsonPath)) {
+                core.setFailed(`Node.js service '${service.name}' must contain ${service.folder}/package.json.`);
+                return;
+              }
+
+              if (!fs.existsSync(lockfilePath)) {
+                core.setFailed(`Node.js service '${service.name}' must contain ${service.folder}/package-lock.json.`);
+                return;
+              }
+
+              if (!fs.existsSync(dockerfilePath)) {
+                core.setFailed(`Dockerfile not found for service '${service.name}': ${service.dockerfile}`);
+                return;
+              }
+
+              let packageJson;
+
+              try {
+                packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+              } catch (error) {
+                core.setFailed(`Invalid package.json for service '${service.name}': ${error instanceof Error ? error.message : String(error)}`);
+                return;
+              }
+
+              const missingScripts = requiredPackageScripts.filter((scriptName) => !packageJson.scripts?.[scriptName]);
+
+              if (missingScripts.length > 0) {
+                core.setFailed(
+                  `Node.js service '${service.name}' must define scripts ${missingScripts.map((scriptName) => `'${scriptName}'`).join(", ")} in ${service.folder}/package.json.`,
+                );
+                return;
+              }
+            }
+
+            const serviceMap = Object.fromEntries(catalog.map((service) => [service.name, service]));
+
+            const normalizeService = (value) => value.trim().toLowerCase();
+            let selected = [];
+
+            if (process.env.EVENT_NAME === "workflow_dispatch") {
+              const rawInput = (process.env.SERVICES_INPUT || "all").trim().toLowerCase();
+
+              if (rawInput === "" || rawInput === "all" || rawInput === "auto") {
+                selected = catalog.map((service) => service.name);
+              } else {
+                selected = rawInput
+                  .split(",")
+                  .map(normalizeService)
+                  .filter(Boolean);
+              }
+            } else {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                per_page: 100,
+              });
+
+              const changedFiles = files.map((file) => file.filename);
+
+              for (const service of catalog) {
+                const folderPrefix = `${String(service.folder).replace(/\\/g, "/").replace(/\/+$/, "")}/`;
+
+                if (changedFiles.some((file) => file.startsWith(folderPrefix))) {
+                  selected.push(service.name);
+                }
+              }
+            }
+
+            const unknownServices = [...new Set(selected)].filter((service) => !serviceMap[service]);
+            if (unknownServices.length > 0) {
+              core.setFailed(`Unknown services requested: ${unknownServices.join(", ")}`);
+              return;
+            }
+
+            selected = [...new Set(selected)].filter((service) => serviceMap[service]);
+
+            const matrix = selected.map((service) => serviceMap[service]);
+
+            core.setOutput("has_changes", String(matrix.length > 0));
+            core.setOutput("catalog", JSON.stringify(catalog));
+            core.setOutput("matrix", JSON.stringify(matrix));
+
+      - name: Validate required secrets
+        if: steps.services.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          SHOULD_DEPLOY: ${{ steps.context.outputs.should_deploy }}
+          TARGET_ENV: ${{ steps.context.outputs.environment }}
+          SERVICE_CATALOG: ${{ steps.services.outputs.catalog }}
+          REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          DEPLOY_CONFIG_STAGE: ${{ secrets.DEPLOY_CONFIG_STAGE }}
+          DEPLOY_CONFIG_PROD: ${{ secrets.DEPLOY_CONFIG_PROD }}
+        run: |
+          set -euo pipefail
+
+          required=(
+            REGISTRY_URL
+            REGISTRY_USERNAME
+            REGISTRY_PASSWORD
+          )
+
+          missing=0
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required secret: $name"
+              missing=1
+            fi
+          done
+
+          [[ "$missing" -eq 0 ]]
+
+          if [[ "$SHOULD_DEPLOY" != "true" ]]; then
+            exit 0
+          fi
+
+          if [[ "$TARGET_ENV" == "stage" && -z "${DEPLOY_CONFIG_STAGE:-}" ]]; then
+            echo "Missing required secret: DEPLOY_CONFIG_STAGE"
+            exit 1
+          fi
+
+          if [[ "$TARGET_ENV" == "prod" && -z "${DEPLOY_CONFIG_PROD:-}" ]]; then
+            echo "Missing required secret: DEPLOY_CONFIG_PROD"
+            exit 1
+          fi
+
+          node <<'EOF'
+          const services = JSON.parse(process.env.SERVICE_CATALOG);
+          const targetEnv = process.env.TARGET_ENV;
+          const configSecret = targetEnv === "stage"
+            ? process.env.DEPLOY_CONFIG_STAGE
+            : process.env.DEPLOY_CONFIG_PROD;
+          let config;
+
+          try {
+            config = JSON.parse(configSecret);
+          } catch (error) {
+            console.error(`Invalid deploy config JSON for ${targetEnv}: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+          }
+
+          if (!config.webhook_url) {
+            console.error(`Deploy config for ${targetEnv} must contain 'webhook_url'.`);
+            process.exit(1);
+          }
+
+          for (const service of services) {
+            if (!config.health_urls?.[service.name]) {
+              console.error(`Deploy config for ${targetEnv} is missing health URL for service '${service.name}'.`);
+              process.exit(1);
+            }
+          }
+          EOF
+
+      - id: version
+        if: steps.services.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          SHOULD_RELEASE: ${{ steps.context.outputs.should_release }}
+          TARGET_ENV: ${{ steps.context.outputs.environment }}
+          SHORT_SHA: ${{ steps.context.outputs.sha_short }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$SHOULD_RELEASE" == "true" ]]; then
+            BASE_VERSION="$(tr -d '\r\n' < VERSION)"
+
+            if [[ ! "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+              echo "VERSION must match <major>.<minor>"
+              exit 1
+            fi
+
+            IMMUTABLE_TAG="v${BASE_VERSION}.${GITHUB_RUN_NUMBER}"
+          elif [[ "$TARGET_ENV" == "stage" ]]; then
+            IMMUTABLE_TAG="stage-${SHORT_SHA}"
+          else
+            IMMUTABLE_TAG="dev-${SHORT_SHA}"
+          fi
+
+          echo "immutable_tag=$IMMUTABLE_TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ matrix.service.folder }}
+          file: ${{ matrix.service.dockerfile }}
+          push: true
+          tags: |
+            ${{ secrets.REGISTRY_URL }}/${{ needs.prepare.outputs.image_prefix }}-${{ matrix.service.image }}:${{ needs.prepare.outputs.immutable_tag }}
+            ${{ secrets.REGISTRY_URL }}/${{ needs.prepare.outputs.image_prefix }}-${{ matrix.service.image }}:${{ needs.prepare.outputs.floating_tag }}
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            NODE_ENV=${{ needs.prepare.outputs.node_env }}
+            SERVICE_NAME=${{ matrix.service.name }}
+            APP_VERSION=${{ needs.prepare.outputs.immutable_tag }}
+
+  deploy:
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.should_deploy == 'true' && needs.prepare.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: portainer-${{ needs.prepare.outputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.target_branch }}
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - id: deploy_config
+        shell: bash
+        env:
+          TARGET_ENV: ${{ needs.prepare.outputs.environment }}
+          SERVICE_CATALOG: ${{ needs.prepare.outputs.services_catalog }}
+          DEPLOY_CONFIG_STAGE: ${{ secrets.DEPLOY_CONFIG_STAGE }}
+          DEPLOY_CONFIG_PROD: ${{ secrets.DEPLOY_CONFIG_PROD }}
+        run: |
+          set -euo pipefail
+
+          node <<'EOF'
+          const fs = require("node:fs");
+
+          const services = JSON.parse(process.env.SERVICE_CATALOG);
+          const targetEnv = process.env.TARGET_ENV;
+          const configSecret = targetEnv === "stage"
+            ? process.env.DEPLOY_CONFIG_STAGE
+            : process.env.DEPLOY_CONFIG_PROD;
+          let deployConfig;
+
+          try {
+            deployConfig = JSON.parse(configSecret);
+          } catch (error) {
+            console.error(`Invalid deploy config JSON for ${targetEnv}: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+          }
+
+          const selectedHealthUrls = [];
+          for (const service of services) {
+            const healthUrl = deployConfig.health_urls?.[service.name];
+
+            if (!healthUrl) {
+              console.error(`Missing health URL for service '${service.name}' in ${targetEnv} deploy config.`);
+              process.exit(1);
+            }
+
+            selectedHealthUrls.push(healthUrl);
+          }
+
+          if (!deployConfig.webhook_url) {
+            console.error(`Missing webhook URL for ${targetEnv} deploy config.`);
+            process.exit(1);
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `webhook_url=${deployConfig.webhook_url}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `health_urls=${JSON.stringify(selectedHealthUrls)}\n`);
+          EOF
+
+      - name: Trigger Portainer stack webhook
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HTTP_CODE="$(curl --silent --show-error --output /dev/null --write-out "%{http_code}" -X POST "${{ steps.deploy_config.outputs.webhook_url }}")"
+          [[ "$HTTP_CODE" -lt 300 ]]
+
+      - name: Wait for stack stabilization
+        shell: bash
+        run: sleep 45
+
+      - id: healthcheck
+        continue-on-error: true
+        shell: bash
+        env:
+          HEALTH_URLS: ${{ steps.deploy_config.outputs.health_urls }}
+        run: |
+          set -euo pipefail
+
+          node <<'EOF' > health-urls.txt
+          const healthUrls = JSON.parse(process.env.HEALTH_URLS);
+          for (const url of healthUrls) {
+            console.log(url);
+          }
+          EOF
+
+          while read -r url; do
+            passed="false"
+
+            for attempt in 1 2 3 4 5; do
+              HTTP_CODE="$(curl --silent --output /dev/null --write-out "%{http_code}" "$url")"
+
+              if [[ "$HTTP_CODE" == "200" ]]; then
+                passed="true"
+                break
+              fi
+
+              sleep "$((attempt * 10))"
+            done
+
+            [[ "$passed" == "true" ]] || exit 1
+          done < health-urls.txt
+
+      - name: Rollback floating tags on failed healthcheck
+        if: steps.healthcheck.outcome == 'failure'
+        shell: bash
+        env:
+          STATE_FILE: ${{ needs.prepare.outputs.state_file }}
+          FLOATING_TAG: ${{ needs.prepare.outputs.floating_tag }}
+          REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+          IMAGE_PREFIX: ${{ needs.prepare.outputs.image_prefix }}
+          SERVICE_CATALOG: ${{ needs.prepare.outputs.services_catalog }}
+          WEBHOOK_URL: ${{ steps.deploy_config.outputs.webhook_url }}
+        run: |
+          set -euo pipefail
+
+          node <<'EOF' > rollback-targets.txt
+          const fs = require("node:fs");
+
+          const state = JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8"));
+          const services = JSON.parse(process.env.SERVICE_CATALOG);
+          const prefix = process.env.IMAGE_PREFIX;
+
+          for (const service of services) {
+            const tag = state[service.name];
+
+            if (tag) {
+              console.log(`${prefix}-${service.image} ${tag}`);
+            }
+          }
+          EOF
+
+          if [[ ! -s rollback-targets.txt ]]; then
+            echo "No previous deploy state available for rollback."
+            exit 1
+          fi
+
+          while read -r image previous_tag; do
+            docker buildx imagetools create \
+              -t "${REGISTRY_URL}/${image}:${FLOATING_TAG}" \
+              "${REGISTRY_URL}/${image}:${previous_tag}"
+          done < rollback-targets.txt
+
+          HTTP_CODE="$(curl --silent --show-error --output /dev/null --write-out "%{http_code}" -X POST "$WEBHOOK_URL")"
+          [[ "$HTTP_CODE" -lt 300 ]]
+
+          exit 1
+
+      - name: Update deploy state
+        if: steps.healthcheck.outcome == 'success'
+        shell: bash
+        env:
+          STATE_FILE: ${{ needs.prepare.outputs.state_file }}
+          SERVICE_MATRIX: ${{ needs.prepare.outputs.matrix }}
+          IMMUTABLE_TAG: ${{ needs.prepare.outputs.immutable_tag }}
+        run: |
+          set -euo pipefail
+
+          node <<'EOF'
+          const fs = require("node:fs");
+
+          const path = process.env.STATE_FILE;
+          const state = JSON.parse(fs.readFileSync(path, "utf8"));
+          const services = JSON.parse(process.env.SERVICE_MATRIX);
+
+          for (const service of services) {
+            state[service.name] = process.env.IMMUTABLE_TAG;
+          }
+
+          fs.writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`);
+          EOF
+
+      - name: Persist deploy state
+        if: steps.healthcheck.outcome == 'success'
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ needs.prepare.outputs.target_branch }}
+          TARGET_ENV: ${{ needs.prepare.outputs.environment }}
+          STATE_FILE: ${{ needs.prepare.outputs.state_file }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$STATE_FILE"
+
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+
+          git commit -m "ci: update ${TARGET_ENV} deploy state"
+          git push origin "HEAD:${TARGET_BRANCH}"
+
+  release:
+    needs:
+      - prepare
+      - build
+      - deploy
+    if: needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+          fetch-depth: 0
+
+      - name: Create Git tag
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.immutable_tag }}
+        run: |
+          set -euo pipefail
+
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.immutable_tag }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
