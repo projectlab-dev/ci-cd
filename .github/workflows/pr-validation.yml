@@ -24,16 +24,16 @@ jobs:
     name: Prepare Validation Matrix
     runs-on: ubuntu-latest
     outputs:
-      has_changes: ${{ steps.services.outputs.has_changes }}
-      services_catalog: ${{ steps.services.outputs.catalog }}
-      matrix: ${{ steps.services.outputs.matrix }}
+      has_changes: ${{ steps.services.outputs.has_changes || 'false' }}
+      services_catalog: ${{ steps.services.outputs.catalog || '[]' }}
+      matrix: ${{ steps.services.outputs.matrix || '{"include":[]}' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - id: services
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require("node:fs");
@@ -125,11 +125,13 @@ jobs:
 
             const matrix = [...new Set(selected)]
               .filter((serviceName) => serviceMap[serviceName])
-              .map((serviceName) => serviceMap[serviceName]);
+              .map((serviceName) => ({
+                service: serviceMap[serviceName],
+              }));
 
             core.setOutput("has_changes", String(matrix.length > 0));
             core.setOutput("catalog", JSON.stringify(catalog));
-            core.setOutput("matrix", JSON.stringify(matrix));
+            core.setOutput("matrix", JSON.stringify({ include: matrix }));
 
   validate:
     name: Validate ${{ matrix.service.name }}
@@ -138,13 +140,12 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        service: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix || '{"include":[]}') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -170,7 +171,7 @@ jobs:
     name: Security Scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master

@@ -169,18 +169,17 @@ O arquivo `VERSION` so e usado na promocao para `main`.
 
 ## Variaveis De Ambiente Da Aplicacao
 
-A pipeline separa duas responsabilidades:
-
-- `NODE_ENV`: modo de execucao do runtime Node.js
-- `APP_ENV`: identificacao do ambiente da esteira
+A pipeline usa `NODE_ENV` como principal sinal de runtime da aplicacao.
 
 Mapeamento atual:
 
-- `dev`: `NODE_ENV=development` e `APP_ENV=development`
-- `stage`: `NODE_ENV=production` e `APP_ENV=staging`
-- `prod`: `NODE_ENV=production` e `APP_ENV=production`
+- `dev`: `NODE_ENV=development`
+- `stage`: `NODE_ENV=production`
+- `prod`: `NODE_ENV=production`
 
 Esse desenho evita usar `NODE_ENV=staging`, porque muitas bibliotecas Node tratam qualquer valor diferente de `production` como comportamento de desenvolvimento.
+
+Se o projeto precisar diferenciar `stage` de `prod` dentro da aplicacao, adicione uma variavel dedicada e ajuste o workflow para publica-la no build.
 
 ## Rollback
 
