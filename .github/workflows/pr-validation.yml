@@ -1,0 +1,226 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - stage
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  prepare:
+    name: Prepare Validation Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.services.outputs.has_changes }}
+      services_catalog: ${{ steps.services.outputs.catalog }}
+      matrix: ${{ steps.services.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: services
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("node:fs");
+            const path = require("node:path");
+
+            const configPath = path.join(process.cwd(), ".github", "services.json");
+            const rawConfig = fs.readFileSync(configPath, "utf8");
+            const parsedConfig = JSON.parse(rawConfig);
+            const catalog = Array.isArray(parsedConfig.services) ? parsedConfig.services : [];
+            const requiredPackageScripts = ["build", "test"];
+            const normalizePath = (value) => String(value).replace(/\\/g, "/").replace(/\/+$/, "");
+
+            if (catalog.length === 0) {
+              core.setFailed("`.github/services.json` must define at least one service.");
+              return;
+            }
+
+            for (const service of catalog) {
+              if (!service.name || !service.folder || !service.dockerfile || !service.image) {
+                core.setFailed("Each service in `.github/services.json` must define `name`, `folder`, `dockerfile` and `image`.");
+                return;
+              }
+
+              service.folder = normalizePath(service.folder);
+              service.dockerfile = normalizePath(service.dockerfile);
+
+              const serviceRoot = path.join(process.cwd(), service.folder);
+              const packageJsonPath = path.join(serviceRoot, "package.json");
+              const lockfilePath = path.join(serviceRoot, "package-lock.json");
+              const dockerfilePath = path.join(process.cwd(), service.dockerfile);
+
+              if (!fs.existsSync(serviceRoot) || !fs.statSync(serviceRoot).isDirectory()) {
+                core.setFailed(`Service folder not found: ${service.folder}`);
+                return;
+              }
+
+              if (!fs.existsSync(packageJsonPath)) {
+                core.setFailed(`Node.js service '${service.name}' must contain ${service.folder}/package.json.`);
+                return;
+              }
+
+              if (!fs.existsSync(lockfilePath)) {
+                core.setFailed(`Node.js service '${service.name}' must contain ${service.folder}/package-lock.json.`);
+                return;
+              }
+
+              if (!fs.existsSync(dockerfilePath)) {
+                core.setFailed(`Dockerfile not found for service '${service.name}': ${service.dockerfile}`);
+                return;
+              }
+
+              let packageJson;
+
+              try {
+                packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+              } catch (error) {
+                core.setFailed(`Invalid package.json for service '${service.name}': ${error instanceof Error ? error.message : String(error)}`);
+                return;
+              }
+
+              const missingScripts = requiredPackageScripts.filter((scriptName) => !packageJson.scripts?.[scriptName]);
+
+              if (missingScripts.length > 0) {
+                core.setFailed(
+                  `Node.js service '${service.name}' must define scripts ${missingScripts.map((scriptName) => `'${scriptName}'`).join(", ")} in ${service.folder}/package.json.`,
+                );
+                return;
+              }
+            }
+
+            const serviceMap = Object.fromEntries(catalog.map((service) => [service.name, service]));
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const changedFiles = files.map((file) => file.filename);
+            const selected = [];
+
+            for (const service of catalog) {
+              const folderPrefix = `${service.folder}/`;
+
+              if (changedFiles.some((file) => file.startsWith(folderPrefix))) {
+                selected.push(service.name);
+              }
+            }
+
+            const matrix = [...new Set(selected)]
+              .filter((serviceName) => serviceMap[serviceName])
+              .map((serviceName) => serviceMap[serviceName]);
+
+            core.setOutput("has_changes", String(matrix.length > 0));
+            core.setOutput("catalog", JSON.stringify(catalog));
+            core.setOutput("matrix", JSON.stringify(matrix));
+
+  validate:
+    name: Validate ${{ matrix.service.name }}
+    needs: prepare
+    if: needs.prepare.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ format('{0}/package-lock.json', matrix.service.folder) }}
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.service.folder }}
+        run: npm ci
+
+      - name: Run Linter
+        working-directory: ${{ matrix.service.folder }}
+        run: npm run lint --if-present
+
+      - name: Run Tests
+        working-directory: ${{ matrix.service.folder }}
+        run: npm test
+
+      - name: Build
+        working-directory: ${{ matrix.service.folder }}
+        run: npm run build
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+  pr-status:
+    name: PR Status Check
+    needs:
+      - prepare
+      - validate
+      - security-scan
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check validation results
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Validation results:"
+          echo "  - Prepare: ${{ needs.prepare.result }}"
+          echo "  - Validate: ${{ needs.validate.result }}"
+          echo "  - Security: ${{ needs.security-scan.result }}"
+
+          FAILED=false
+
+          if [[ "${{ needs.prepare.result }}" == "failure" ]]; then
+            echo "Prepare step failed."
+            FAILED=true
+          fi
+
+          if [[ "${{ needs.validate.result }}" == "failure" ]]; then
+            echo "Service validation failed."
+            FAILED=true
+          fi
+
+          if [[ "${{ needs.security-scan.result }}" == "failure" ]]; then
+            echo "Security scan failed."
+            FAILED=true
+          fi
+
+          if [[ "$FAILED" == "true" ]]; then
+            echo "PR validation failed."
+            exit 1
+          fi
+
+          echo "PR validation passed."
