@@ -1,0 +1,22 @@
+{
+  "services": [
+    {
+      "name": "backend",
+      "folder": "backend",
+      "dockerfile": "backend/Dockerfile",
+      "image": "backend"
+    },
+    {
+      "name": "frontend",
+      "folder": "frontend",
+      "dockerfile": "frontend/Dockerfile",
+      "image": "frontend"
+    },
+    {
+      "name": "landing",
+      "folder": "landing",
+      "dockerfile": "landing/Dockerfile",
+      "image": "landing"
+    }
+  ]
+}
