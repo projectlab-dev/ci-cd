@@ -1,0 +1,14 @@
+# Define o comportamento padrão para todos os arquivos:
+# Detecta automaticamente se é texto e força o uso de LF no checkout
+* text=auto eol=lf
+
+# Garante que arquivos específicos sempre usem LF
+*.ts text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+
+# Arquivos binários não devem ser tocados
+*.png binary
+*.jpg binary
