@@ -1,0 +1,92 @@
+name: ci-cd-default
+
+services:
+  backend:
+    image: ci-cd-default-backend:local
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        NODE_VERSION: "20"
+        NODE_ENV: development
+        SERVICE_NAME: backend
+        APP_ENV: compose
+        APP_VERSION: compose-local
+    environment:
+      NODE_ENV: development
+      SERVICE_NAME: backend
+      APP_ENV: compose
+      APP_VERSION: compose-local
+      PORT: "3000"
+    ports:
+      - "3001:3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/health').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    image: ci-cd-default-frontend:local
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NODE_VERSION: "20"
+        NODE_ENV: development
+        SERVICE_NAME: frontend
+        APP_ENV: compose
+        APP_VERSION: compose-local
+    environment:
+      NODE_ENV: development
+      SERVICE_NAME: frontend
+      APP_ENV: compose
+      APP_VERSION: compose-local
+      PORT: "3000"
+    ports:
+      - "3002:3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/health').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  landing:
+    image: ci-cd-default-landing:local
+    build:
+      context: ./landing
+      dockerfile: Dockerfile
+      args:
+        NODE_VERSION: "20"
+        NODE_ENV: development
+        SERVICE_NAME: landing
+        APP_ENV: compose
+        APP_VERSION: compose-local
+    environment:
+      NODE_ENV: development
+      SERVICE_NAME: landing
+      APP_ENV: compose
+      APP_VERSION: compose-local
+      PORT: "3000"
+    ports:
+      - "3003:3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/health').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
